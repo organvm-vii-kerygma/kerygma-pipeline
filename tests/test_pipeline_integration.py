@@ -15,18 +15,20 @@ TEMPLATES_DIR = Path(__file__).parent.parent.parent / "announcement-templates" /
 
 @pytest.fixture
 def sample_registry(tmp_path):
-    """Minimal registry fixture for integration tests."""
+    """Minimal registry fixture for integration tests (registry-v2 format)."""
     reg = {
-        "ORGAN-V": {
-            "repos": [
-                {
-                    "name": "public-process",
-                    "description": "Public accountability ledger",
-                    "tier": "flagship",
-                    "github_url": "https://github.com/organvm-v-logos/public-process",
-                    "implementation_status": "PRODUCTION",
-                }
-            ]
+        "organs": {
+            "ORGAN-V": {
+                "repos": [
+                    {
+                        "name": "public-process",
+                        "description": "Public accountability ledger",
+                        "tier": "flagship",
+                        "github_url": "https://github.com/organvm-v-logos/public-process",
+                        "implementation_status": "PRODUCTION",
+                    }
+                ]
+            }
         }
     }
     path = tmp_path / "registry.json"
@@ -152,7 +154,9 @@ class TestPipelineActivate:
         report = pipeline.activate()
         expected_keys = {"templates_ok", "event_map_ok", "ready", "templates_loaded",
                          "event_map_total", "event_map_unresolved", "platforms_configured",
-                         "social_config_ok", "sample_render_ok"}
+                         "social_config_ok", "sample_render_ok", "calendar_ok",
+                         "channels_ok", "calendar_events", "channels_registered",
+                         "channels_enabled"}
         assert expected_keys.issubset(report.keys())
 
     def test_activate_reports_zero_platforms(self, pipeline):
@@ -239,6 +243,7 @@ class TestPipelineReportWithMetrics:
             "delivery_log_path: ''\n"
             "rss_feed_url: ''\n"
             "live_mode: false\n"
+            "channels: []\n"
         )
         p = KerygmaPipeline(
             templates_dir=TEMPLATES_DIR,

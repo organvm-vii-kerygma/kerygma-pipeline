@@ -35,6 +35,10 @@ from kerygma_social.rss_poller import RssPoller
 
 from kerygma_strategy.analytics import AnalyticsCollector, EngagementMetric
 from kerygma_strategy.persistence import JsonStore
+from kerygma_strategy.scheduler import ContentScheduler, ScheduleEntry, Frequency, PrioritizedEntry
+from kerygma_strategy.calendar import DistributionCalendar, CalendarEvent
+from kerygma_strategy.channels import ChannelRegistry, ChannelConfig
+from kerygma_strategy.report_generator import ReportGenerator, ReportPeriod, ReportData
 
 logger = logging.getLogger("kerygma.pipeline")
 
@@ -58,7 +62,7 @@ def _find_templates_dir() -> Path:
 
 
 TEMPLATES_DIR = _find_templates_dir()
-REGISTRY_PATH = Path.home() / "Workspace/organvm-iv-taxis/orchestration-start-here/registry.json"
+REGISTRY_PATH = Path.home() / "Workspace/meta-organvm/organvm-corpvs-testamentvm/registry-v2.json"
 
 
 # --- Template-to-event mapping ---
@@ -103,6 +107,8 @@ class KerygmaPipeline:
         registry_path: Path | None = None,
         social_config_path: Path | None = None,
         analytics_store_path: Path | None = None,
+        calendar_config_path: Path | None = None,
+        schedule_store_path: Path | None = None,
     ) -> None:
         # Template engine
         self._engine = TemplateEngine()
@@ -124,6 +130,72 @@ class KerygmaPipeline:
         # Delivery log
         log_path = Path(self._social_config.delivery_log_path) if self._social_config.delivery_log_path else None
         self._delivery_log = DeliveryLog(log_path)
+
+        # Strategy layer: calendar, channels, scheduler, report generator
+        self._calendar = self._load_calendar(calendar_config_path or social_config_path)
+        self._channel_registry = self._load_channel_registry(social_config_path)
+        self._scheduler = ContentScheduler(calendar=self._calendar)
+        self._report_generator = ReportGenerator(self._analytics)
+
+        # Schedule persistence
+        self._schedule_store_path = schedule_store_path
+        self._schedule_store = JsonStore(schedule_store_path) if schedule_store_path else None
+        if self._schedule_store:
+            self._load_schedule_from_store()
+
+    def _load_calendar(self, config_path: Path | None) -> DistributionCalendar:
+        """Load calendar from YAML config, falling back to empty."""
+        if config_path and config_path.exists():
+            try:
+                return DistributionCalendar.from_yaml(config_path)
+            except Exception as exc:
+                logger.warning("Failed to load calendar from %s: %s", config_path, exc)
+        return DistributionCalendar()
+
+    def _load_channel_registry(self, config_path: Path | None) -> ChannelRegistry:
+        """Load channel registry from YAML config, falling back to empty."""
+        if config_path and config_path.exists():
+            try:
+                return ChannelRegistry.from_yaml(config_path)
+            except Exception as exc:
+                logger.warning("Failed to load channel registry from %s: %s", config_path, exc)
+        return ChannelRegistry()
+
+    def _load_schedule_from_store(self) -> None:
+        """Restore schedule entries from persistent store."""
+        if not self._schedule_store:
+            return
+        entries = self._schedule_store.get("schedule_entries", [])
+        for item in entries:
+            try:
+                entry = ScheduleEntry(
+                    entry_id=item["entry_id"],
+                    content_id=item["content_id"],
+                    channel=item["channel"],
+                    scheduled_time=datetime.fromisoformat(item["scheduled_time"]),
+                    frequency=Frequency(item.get("frequency", "once")),
+                    published=item.get("published", False),
+                )
+                self._scheduler.schedule(entry)
+            except (KeyError, ValueError) as exc:
+                logger.warning("Skipping invalid schedule entry: %s", exc)
+
+    def _save_schedule_to_store(self) -> None:
+        """Persist current schedule entries to store."""
+        if not self._schedule_store:
+            return
+        entries = []
+        for entry in self._scheduler.get_due() + self._scheduler.get_upcoming(hours=8760):
+            entries.append({
+                "entry_id": entry.entry_id,
+                "content_id": entry.content_id,
+                "channel": entry.channel,
+                "scheduled_time": entry.scheduled_time.isoformat(),
+                "frequency": entry.frequency.value,
+                "published": entry.published,
+            })
+        self._schedule_store.set("schedule_entries", entries)
+        self._schedule_store.save()
 
     def _build_distributor(self) -> PosseDistributor:
         return build_distributor(self._social_config, delivery_log=self._delivery_log)
@@ -217,6 +289,11 @@ class KerygmaPipeline:
                     "total_impressions": sum(r.impressions for r in records),
                 }
 
+        # Calendar state
+        active_events = self._calendar.get_active_events()
+        upcoming_events = self._calendar.get_upcoming(days=30)
+        current_modifier = self._calendar.get_posting_modifier()
+
         return {
             "templates_loaded": len(templates),
             "template_ids": [t.template_id for t in templates],
@@ -230,6 +307,24 @@ class KerygmaPipeline:
                 "ghost": bool(self._social_config.ghost_api_url),
                 "live_mode": self._social_config.live_mode,
             },
+            "scheduler": {
+                "total_entries": self._scheduler.total_entries,
+                "pending": self._scheduler.pending_count,
+                "due_now": len(self._scheduler.get_due()),
+            },
+            "calendar": {
+                "total_events": self._calendar.total_events,
+                "active_events": [e.name for e in active_events],
+                "current_modifier": current_modifier,
+                "upcoming_30d": [
+                    {"name": e.name, "start": e.start_date.isoformat(), "modifier": e.posting_modifier}
+                    for e in upcoming_events
+                ],
+            },
+            "channels": {
+                "total": self._channel_registry.total_channels,
+                "enabled": len(self._channel_registry.get_enabled()),
+            },
         }
 
     def preview(self, template_id: str, repo_name: str, channel: str) -> str:
@@ -240,36 +335,17 @@ class KerygmaPipeline:
         return render.text
 
     def generate_report(self, period_days: int = 7) -> str:
-        """Generate a Markdown report summarizing distribution activity."""
-        cutoff = datetime.now() - timedelta(days=period_days)
-        lines = [
-            f"# Kerygma Distribution Report",
-            f"",
-            f"**Period:** {cutoff.strftime('%Y-%m-%d')} to {datetime.now().strftime('%Y-%m-%d')}",
-            f"**Generated:** {datetime.now().isoformat()}",
-            f"",
-            f"## Pipeline Status",
-            f"",
-        ]
+        """Generate a Markdown report using ReportGenerator + supplemental sections."""
+        now = datetime.now()
+        if period_days <= 7:
+            period = ReportPeriod.weekly(end=now)
+        else:
+            period = ReportPeriod.monthly(end=now)
 
-        status = self.status()
-        lines.append(f"- Templates loaded: {status['templates_loaded']}")
-        lines.append(f"- Event map entries: {status['event_map_entries']}")
-        lines.append(f"- Delivery log entries: {status['delivery_log_entries']}")
-        lines.append(f"")
+        report_data = self._report_generator.generate(period)
+        lines = [self._report_generator.to_markdown(report_data)]
 
-        lines.append(f"## Channel Summary")
-        lines.append(f"")
-        lines.append(f"| Channel | Configured | Records | Impressions |")
-        lines.append(f"|---------|------------|---------|-------------|")
-        for channel in ("mastodon", "discord", "bluesky", "ghost"):
-            configured = status["social_config"].get(channel, False)
-            analytics = status.get("analytics", {}).get(channel, {})
-            records = analytics.get("total_records", 0)
-            impressions = analytics.get("total_impressions", 0)
-            lines.append(f"| {channel} | {'yes' if configured else 'no'} | {records} | {impressions} |")
-
-        # Platform metrics (Phase 3: AUTONOMIA)
+        # Platform metrics
         platform_metrics = self._collect_platform_metrics()
         if platform_metrics:
             lines.append("")
@@ -281,11 +357,24 @@ class KerygmaPipeline:
                 for metric_name, value in metrics.items():
                     lines.append(f"| {platform} | {metric_name} | {value} |")
 
+        # Schedule summary
         lines.append("")
-        lines.append("## Available Templates")
+        lines.append("## Schedule Summary")
         lines.append("")
-        for tid in status.get("template_ids", []):
-            lines.append(f"- `{tid}`")
+        lines.append(f"- Pending entries: {self._scheduler.pending_count}")
+        lines.append(f"- Due now: {len(self._scheduler.get_due())}")
+        upcoming = self._scheduler.get_upcoming(hours=168)  # 7 days
+        lines.append(f"- Upcoming (7 days): {len(upcoming)}")
+
+        # Calendar events
+        upcoming_events = self._calendar.get_upcoming(days=30)
+        if upcoming_events:
+            lines.append("")
+            lines.append("## Upcoming Calendar Events (30 days)")
+            lines.append("")
+            for ev in upcoming_events:
+                end_str = f" to {ev.end_date.isoformat()}" if ev.end_date else ""
+                lines.append(f"- **{ev.name}** ({ev.start_date.isoformat()}{end_str}) — modifier: {ev.posting_modifier}")
 
         lines.append("")
         lines.append("---")
@@ -376,11 +465,23 @@ class KerygmaPipeline:
                 logger.warning("Sample render failed: %s", exc)
         checks["sample_render_ok"] = sample_ok
 
+        # 6. Calendar loaded
+        checks["calendar_events"] = self._calendar.total_events
+        checks["calendar_ok"] = self._calendar.total_events > 0
+
+        # 7. Channel registry has enabled channels
+        enabled_channels = self._channel_registry.get_enabled()
+        checks["channels_registered"] = self._channel_registry.total_channels
+        checks["channels_enabled"] = len(enabled_channels)
+        checks["channels_ok"] = len(enabled_channels) > 0
+
         # Overall go/no-go
         checks["ready"] = all([
             checks["templates_ok"],
             checks["event_map_ok"],
             checks["sample_render_ok"],
+            checks["calendar_ok"],
+            checks["channels_ok"],
         ])
 
         return checks
@@ -398,6 +499,188 @@ class KerygmaPipeline:
             {"title": e.title, "url": e.url, "id": e.entry_id}
             for e in entries
         ]
+
+    def schedule_content(
+        self,
+        content_id: str,
+        channels: list[str],
+        scheduled_time: datetime | None = None,
+        frequency: Frequency = Frequency.ONCE,
+    ) -> list[ScheduleEntry]:
+        """Create schedule entries for content across channels.
+
+        Uses calendar-aware scheduling to delay posts during quiet periods.
+        """
+        at = scheduled_time or datetime.now()
+        created: list[ScheduleEntry] = []
+
+        for channel in channels:
+            entry_id = f"{content_id}-{channel}-{at.strftime('%Y%m%d%H%M%S')}"
+            entry = ScheduleEntry(
+                entry_id=entry_id,
+                content_id=content_id,
+                channel=channel,
+                scheduled_time=at,
+                frequency=frequency,
+            )
+            scheduled = self._scheduler.schedule_with_calendar(entry)
+            created.append(scheduled)
+
+        self._save_schedule_to_store()
+        return created
+
+    def process_due_entries(self) -> list[dict[str, Any]]:
+        """Process all due schedule entries: render, check, dispatch, record.
+
+        Returns a list of result dicts per processed entry.
+        """
+        prioritized = self._scheduler.get_due_with_priority()
+        results: list[dict[str, Any]] = []
+
+        for p_entry in prioritized:
+            entry = p_entry.entry
+            try:
+                # Attempt to select template via event map, fall back to content_id as template
+                template_id = EVENT_TEMPLATE_MAP.get(entry.content_id, entry.content_id)
+                channel_texts = self.render_and_check(
+                    template_id, entry.content_id, [entry.channel],
+                )
+
+                if channel_texts:
+                    records = self.dispatch(channel_texts)
+                    self.record_analytics(records)
+                    self._scheduler.publish_entry(entry.entry_id)
+                    results.append({
+                        "entry_id": entry.entry_id,
+                        "status": "dispatched",
+                        "priority": p_entry.priority,
+                        "records": records,
+                    })
+                else:
+                    results.append({
+                        "entry_id": entry.entry_id,
+                        "status": "no_channels_passed",
+                        "priority": p_entry.priority,
+                    })
+            except Exception as exc:
+                logger.warning("Failed to process entry %s: %s", entry.entry_id, exc)
+                results.append({
+                    "entry_id": entry.entry_id,
+                    "status": "error",
+                    "error": str(exc),
+                })
+
+        self._save_schedule_to_store()
+        return results
+
+    def backfill_from_posts(
+        self,
+        posts_dir: Path,
+        channels: list[str] | None = None,
+        stagger_minutes: int = 30,
+        execute: bool = False,
+    ) -> dict[str, Any]:
+        """Scan a Jekyll _posts/ directory and schedule undistributed posts.
+
+        In dry-run mode (execute=False): reports what would be scheduled.
+        In execute mode: creates staggered ScheduleEntry per post.
+        """
+        if channels is None:
+            channels = ["mastodon", "discord"]
+
+        if not posts_dir.is_dir():
+            return {"error": f"Posts directory not found: {posts_dir}", "posts": []}
+
+        post_files = sorted(posts_dir.glob("*.md"))
+        if not post_files:
+            post_files = sorted(posts_dir.glob("*.markdown"))
+
+        report: list[dict[str, Any]] = []
+        scheduled_count = 0
+        skipped_count = 0
+        base_time = datetime.now()
+
+        for i, post_file in enumerate(post_files):
+            frontmatter = self._parse_jekyll_frontmatter(post_file)
+            if not frontmatter:
+                skipped_count += 1
+                continue
+
+            content_id = frontmatter.get("slug") or post_file.stem
+            title = frontmatter.get("title", content_id)
+
+            # Check delivery log for dedup (check all target channels)
+            already_delivered = any(
+                self._delivery_log.has_been_delivered(content_id, ch)
+                for ch in channels
+            )
+            if already_delivered:
+                skipped_count += 1
+                report.append({
+                    "file": post_file.name,
+                    "title": title,
+                    "action": "skip_already_delivered",
+                })
+                continue
+
+            stagger_time = base_time + timedelta(minutes=stagger_minutes * scheduled_count)
+
+            if execute:
+                entries = self.schedule_content(
+                    content_id=content_id,
+                    channels=channels,
+                    scheduled_time=stagger_time,
+                )
+                report.append({
+                    "file": post_file.name,
+                    "title": title,
+                    "action": "scheduled",
+                    "scheduled_time": stagger_time.isoformat(),
+                    "entries": len(entries),
+                })
+            else:
+                report.append({
+                    "file": post_file.name,
+                    "title": title,
+                    "action": "would_schedule",
+                    "scheduled_time": stagger_time.isoformat(),
+                    "channels": channels,
+                })
+
+            scheduled_count += 1
+
+        return {
+            "total_files": len(post_files),
+            "scheduled": scheduled_count,
+            "skipped": skipped_count,
+            "execute": execute,
+            "posts": report,
+        }
+
+    @staticmethod
+    def _parse_jekyll_frontmatter(path: Path) -> dict[str, Any] | None:
+        """Parse YAML frontmatter from a Jekyll post file.
+
+        Returns the frontmatter dict, or None if no valid frontmatter found.
+        """
+        try:
+            text = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            return None
+
+        if not text.startswith("---"):
+            return None
+
+        # Find closing ---
+        end = text.find("---", 3)
+        if end == -1:
+            return None
+
+        import yaml
+        try:
+            return yaml.safe_load(text[3:end])
+        except Exception:
+            return None
 
     def run_full_pipeline(
         self,
@@ -438,6 +721,7 @@ def main(argv: list[str] | None = None) -> None:
     )
     parser.add_argument("--social-config", type=Path, default=None)
     parser.add_argument("--analytics-store", type=Path, default=None)
+    parser.add_argument("--calendar-config", type=Path, default=None)
     sub = parser.add_subparsers(dest="command")
 
     dispatch_p = sub.add_parser("dispatch", help="Render + dispatch announcement")
@@ -461,14 +745,48 @@ def main(argv: list[str] | None = None) -> None:
     report_p.add_argument("--period", default="weekly", choices=["daily", "weekly", "monthly"],
                            help="Report period")
 
+    # Schedule subcommands
+    schedule_p = sub.add_parser("schedule", help="Manage publication schedule")
+    schedule_sub = schedule_p.add_subparsers(dest="schedule_command")
+
+    schedule_sub.add_parser("list", help="Show upcoming entries (next 7 days)")
+    schedule_sub.add_parser("due", help="Show entries due now with priority scores")
+    schedule_sub.add_parser("process", help="Render + dispatch all due entries")
+
+    schedule_add_p = schedule_sub.add_parser("add", help="Add a schedule entry")
+    schedule_add_p.add_argument("--content-id", required=True, help="Content identifier")
+    schedule_add_p.add_argument("--channels", required=True, help="Comma-separated channels")
+    schedule_add_p.add_argument("--at", required=True, help="Scheduled time (ISO 8601)")
+    schedule_add_p.add_argument("--frequency", default="once",
+                                choices=["once", "daily", "weekly", "biweekly", "monthly"],
+                                help="Recurrence frequency")
+
+    # Backfill subcommand
+    backfill_p = sub.add_parser("backfill", help="Schedule undistributed Jekyll posts")
+    backfill_p.add_argument("--posts-dir", type=Path, required=True,
+                            help="Path to Jekyll _posts/ directory")
+    backfill_p.add_argument("--channels", default="mastodon,discord",
+                            help="Comma-separated channels")
+    backfill_p.add_argument("--stagger", type=int, default=30,
+                            help="Minutes between staggered posts (default: 30)")
+    backfill_p.add_argument("--execute", action="store_true",
+                            help="Actually create entries (default: dry-run)")
+
     args = parser.parse_args(argv)
     if not args.command:
         parser.print_help()
         return
 
+    # Derive schedule_store_path from analytics_store if provided
+    schedule_store = None
+    if args.analytics_store:
+        schedule_store = args.analytics_store.parent / "schedule.json"
+
     pipeline = KerygmaPipeline(
         social_config_path=args.social_config,
         analytics_store_path=args.analytics_store,
+        calendar_config_path=args.calendar_config or args.social_config,
+        schedule_store_path=schedule_store,
     )
 
     if args.command == "dispatch":
@@ -509,6 +827,54 @@ def main(argv: list[str] | None = None) -> None:
         period_days = {"daily": 1, "weekly": 7, "monthly": 30}[args.period]
         report = pipeline.generate_report(period_days=period_days)
         print(report)
+    elif args.command == "schedule":
+        if not args.schedule_command or args.schedule_command == "list":
+            upcoming = pipeline._scheduler.get_upcoming(hours=168)
+            if upcoming:
+                for e in upcoming:
+                    print(f"  [{e.entry_id}] {e.channel} @ {e.scheduled_time.isoformat()} "
+                          f"({'published' if e.published else 'pending'})")
+            else:
+                print("No upcoming entries in the next 7 days.")
+        elif args.schedule_command == "due":
+            prioritized = pipeline._scheduler.get_due_with_priority()
+            if prioritized:
+                for p in prioritized:
+                    print(f"  [{p.entry.entry_id}] {p.entry.channel} "
+                          f"priority={p.priority:.2f} modifier={p.modifier:.1f}")
+            else:
+                print("No entries due right now.")
+        elif args.schedule_command == "process":
+            results = pipeline.process_due_entries()
+            print(f"Processed {len(results)} entries.")
+            for r in results:
+                print(f"  [{r['status'].upper()}] {r['entry_id']}")
+        elif args.schedule_command == "add":
+            channels = [c.strip() for c in args.channels.split(",")]
+            at = datetime.fromisoformat(args.at)
+            freq = Frequency(args.frequency)
+            entries = pipeline.schedule_content(
+                content_id=args.content_id,
+                channels=channels,
+                scheduled_time=at,
+                frequency=freq,
+            )
+            print(f"Scheduled {len(entries)} entries.")
+            for e in entries:
+                print(f"  [{e.entry_id}] {e.channel} @ {e.scheduled_time.isoformat()}")
+    elif args.command == "backfill":
+        channels = [c.strip() for c in args.channels.split(",")]
+        result = pipeline.backfill_from_posts(
+            posts_dir=args.posts_dir,
+            channels=channels,
+            stagger_minutes=args.stagger,
+            execute=args.execute,
+        )
+        mode = "EXECUTE" if result["execute"] else "DRY-RUN"
+        print(f"[{mode}] Backfill: {result['scheduled']} to schedule, "
+              f"{result['skipped']} skipped, {result['total_files']} total files.")
+        for post in result["posts"]:
+            print(f"  [{post['action'].upper()}] {post['file']}: {post.get('title', '')}")
 
 
 if __name__ == "__main__":

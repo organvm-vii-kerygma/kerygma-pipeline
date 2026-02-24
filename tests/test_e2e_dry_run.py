@@ -19,30 +19,32 @@ TEMPLATES_DIR = Path(__file__).parent.parent.parent / "announcement-templates" /
 
 @pytest.fixture
 def registry(tmp_path):
-    """Minimal registry with ORGAN-V repo."""
+    """Minimal registry with ORGAN-V repo (registry-v2 format)."""
     reg = {
-        "ORGAN-V": {
-            "repos": [
-                {
-                    "name": "public-process",
-                    "description": "Public accountability ledger",
-                    "tier": "flagship",
-                    "github_url": "https://github.com/organvm-v-logos/public-process",
-                    "implementation_status": "PRODUCTION",
-                }
-            ]
-        },
-        "ORGAN-III": {
-            "repos": [
-                {
-                    "name": "tab-bookmark-manager",
-                    "description": "Browser extension for bookmark management",
-                    "tier": "standard",
-                    "github_url": "https://github.com/labores-profani-crux/tab-bookmark-manager",
-                    "implementation_status": "PRODUCTION",
-                }
-            ]
-        },
+        "organs": {
+            "ORGAN-V": {
+                "repos": [
+                    {
+                        "name": "public-process",
+                        "description": "Public accountability ledger",
+                        "tier": "flagship",
+                        "github_url": "https://github.com/organvm-v-logos/public-process",
+                        "implementation_status": "PRODUCTION",
+                    }
+                ]
+            },
+            "ORGAN-III": {
+                "repos": [
+                    {
+                        "name": "tab-bookmark-manager",
+                        "description": "Browser extension for bookmark management",
+                        "tier": "standard",
+                        "github_url": "https://github.com/labores-profani-crux/tab-bookmark-manager",
+                        "implementation_status": "PRODUCTION",
+                    }
+                ]
+            },
+        }
     }
     path = tmp_path / "registry.json"
     path.write_text(json.dumps(reg))
@@ -163,6 +165,5 @@ class TestEndToEndDryRun:
     def test_report_generation(self, pipeline):
         """Report generates valid markdown."""
         report = pipeline.generate_report(period_days=7)
-        assert "# Kerygma Distribution Report" in report
-        assert "Channel Summary" in report
-        assert "Available Templates" in report
+        assert "# Distribution Report" in report
+        assert "Schedule Summary" in report

@@ -30,6 +30,10 @@ live_mode: false  # Set true for production posting
 # --- Distribution Strategy ---
 
 analytics_store_path: "analytics.json"
+schedule_store_path: "schedule.json"
+
+# Path to Jekyll _posts/ directory for backfill command
+# posts_directory: "~/Workspace/organvm-v-logos/public-process/_posts"
 
 channels:
   - channel_id: mastodon-primary
