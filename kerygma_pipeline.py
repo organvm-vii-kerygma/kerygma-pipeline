@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import logging
 import sys
 import uuid
 from datetime import datetime, timedelta
@@ -27,10 +28,7 @@ from kerygma_templates.quality_checker import QualityChecker
 from kerygma_templates.registry_loader import RegistryLoader, EventContext
 
 from kerygma_social.config import load_config as load_social_config
-from kerygma_social.mastodon import MastodonClient, MastodonConfig
-from kerygma_social.discord import DiscordWebhook
-from kerygma_social.bluesky import BlueskyClient, BlueskyConfig
-from kerygma_social.ghost import GhostClient, GhostConfig
+from kerygma_social.factory import build_distributor
 from kerygma_social.posse import PosseDistributor, Platform
 from kerygma_social.delivery_log import DeliveryLog
 from kerygma_social.rss_poller import RssPoller
@@ -38,10 +36,28 @@ from kerygma_social.rss_poller import RssPoller
 from kerygma_strategy.analytics import AnalyticsCollector, EngagementMetric
 from kerygma_strategy.persistence import JsonStore
 
+logger = logging.getLogger("kerygma.pipeline")
+
 
 # --- Default paths ---
 
-TEMPLATES_DIR = Path(__file__).parent / "announcement-templates" / "templates"
+
+def _find_templates_dir() -> Path:
+    """Resolve templates directory relative to superproject root.
+
+    Walks up from __file__ looking for announcement-templates/templates/.
+    Handles running from kerygma-pipeline/ subdir or superproject root.
+    """
+    here = Path(__file__).resolve().parent
+    for ancestor in (here, here.parent, here.parent.parent):
+        candidate = ancestor / "announcement-templates" / "templates"
+        if candidate.is_dir():
+            return candidate
+    # Fallback: assume superproject layout (kerygma-pipeline/ is sibling)
+    return here.parent / "announcement-templates" / "templates"
+
+
+TEMPLATES_DIR = _find_templates_dir()
 REGISTRY_PATH = Path.home() / "Workspace/organvm-iv-taxis/orchestration-start-here/registry.json"
 
 
@@ -66,6 +82,8 @@ EVENT_TEMPLATE_MAP: dict[str, str] = {
     # ORGAN-VI: Koinonia
     "salon-scheduled": "salon-invite",
     "workshop-scheduled": "workshop-sprint",
+    "reading-group-scheduled": "reading-group",
+    "community-milestone": "community-milestone",
     "partnership-announced": "partnership",
     # ORGAN-VII: Kerygma
     "press-release": "press-release",
@@ -108,46 +126,7 @@ class KerygmaPipeline:
         self._delivery_log = DeliveryLog(log_path)
 
     def _build_distributor(self) -> PosseDistributor:
-        cfg = self._social_config
-        mastodon = None
-        if cfg.mastodon_instance_url:
-            mastodon = MastodonClient(
-                MastodonConfig(
-                    instance_url=cfg.mastodon_instance_url,
-                    access_token=cfg.mastodon_access_token,
-                ),
-                live=cfg.live_mode,
-            )
-
-        discord = None
-        if cfg.discord_webhook_url:
-            discord = DiscordWebhook(cfg.discord_webhook_url, live=cfg.live_mode)
-
-        bluesky = None
-        if cfg.bluesky_handle:
-            bluesky = BlueskyClient(
-                BlueskyConfig(handle=cfg.bluesky_handle, app_password=cfg.bluesky_app_password),
-                live=cfg.live_mode,
-            )
-
-        ghost = None
-        if cfg.ghost_api_url:
-            ghost = GhostClient(
-                GhostConfig(
-                    admin_api_key=cfg.ghost_admin_api_key,
-                    api_url=cfg.ghost_api_url,
-                    newsletter_slug=cfg.ghost_newsletter_slug,
-                ),
-                live=cfg.live_mode,
-            )
-
-        return PosseDistributor(
-            mastodon_client=mastodon,
-            discord_webhook=discord,
-            bluesky_client=bluesky,
-            ghost_client=ghost,
-            delivery_log=self._delivery_log,
-        )
+        return build_distributor(self._social_config, delivery_log=self._delivery_log)
 
     def select_template(self, event_type: str) -> str:
         """Map an event type to a template ID."""
@@ -187,7 +166,7 @@ class KerygmaPipeline:
                 results[channel] = render.text
             else:
                 errors = "; ".join(c.message for c in report.errors)
-                print(f"  [SKIP] {template_id}/{channel}: {errors}", file=sys.stderr)
+                logger.warning("Quality check failed for %s/%s: %s", template_id, channel, errors)
 
         return results
 
@@ -290,22 +269,130 @@ class KerygmaPipeline:
             impressions = analytics.get("total_impressions", 0)
             lines.append(f"| {channel} | {'yes' if configured else 'no'} | {records} | {impressions} |")
 
-        lines.append(f"")
-        lines.append(f"## Available Templates")
-        lines.append(f"")
+        # Platform metrics (Phase 3: AUTONOMIA)
+        platform_metrics = self._collect_platform_metrics()
+        if platform_metrics:
+            lines.append("")
+            lines.append("## Platform Metrics")
+            lines.append("")
+            lines.append("| Platform | Metric | Value |")
+            lines.append("|----------|--------|-------|")
+            for platform, metrics in platform_metrics.items():
+                for metric_name, value in metrics.items():
+                    lines.append(f"| {platform} | {metric_name} | {value} |")
+
+        lines.append("")
+        lines.append("## Available Templates")
+        lines.append("")
         for tid in status.get("template_ids", []):
             lines.append(f"- `{tid}`")
 
-        lines.append(f"")
-        lines.append(f"---")
-        lines.append(f"*Generated by kerygma_pipeline.py report*")
+        lines.append("")
+        lines.append("---")
+        lines.append("*Generated by kerygma_pipeline.py report*")
         return "\n".join(lines)
+
+    def _collect_platform_metrics(self) -> dict[str, dict[str, Any]]:
+        """Pull site-level metrics from configured platforms."""
+        metrics: dict[str, dict[str, Any]] = {}
+
+        if self._social_config.ghost_api_url and self._social_config.ghost_admin_api_key:
+            try:
+                from kerygma_strategy.ghost_metrics import GhostMetricsClient, GhostMetricsConfig
+                client = GhostMetricsClient(
+                    GhostMetricsConfig(
+                        api_url=self._social_config.ghost_api_url,
+                        admin_api_key=self._social_config.ghost_admin_api_key,
+                    ),
+                    live=self._social_config.live_mode,
+                )
+                metrics["ghost"] = client.get_site_metrics()
+            except Exception as exc:
+                logger.warning("Failed to collect Ghost metrics: %s", exc)
+
+        if self._social_config.mastodon_instance_url and self._social_config.mastodon_access_token:
+            try:
+                from kerygma_strategy.mastodon_metrics import MastodonMetricsClient, MastodonMetricsConfig
+                client = MastodonMetricsClient(
+                    MastodonMetricsConfig(
+                        instance_url=self._social_config.mastodon_instance_url,
+                        access_token=self._social_config.mastodon_access_token,
+                    ),
+                    live=self._social_config.live_mode,
+                )
+                metrics["mastodon"] = client.get_account_stats()
+            except Exception as exc:
+                logger.warning("Failed to collect Mastodon metrics: %s", exc)
+
+        return metrics
+
+    def activate(self) -> dict[str, Any]:
+        """Run comprehensive pre-flight checks for pipeline readiness."""
+        checks: dict[str, Any] = {}
+
+        # 1. Templates loaded
+        templates = self._engine.list_templates()
+        checks["templates_loaded"] = len(templates)
+        checks["templates_ok"] = len(templates) > 0
+
+        # 2. EVENT_TEMPLATE_MAP entries all resolve
+        unresolved = []
+        for event_type, template_id in EVENT_TEMPLATE_MAP.items():
+            if not self._engine.get_template(template_id):
+                unresolved.append(f"{event_type} -> {template_id}")
+        checks["event_map_total"] = len(EVENT_TEMPLATE_MAP)
+        checks["event_map_unresolved"] = unresolved
+        checks["event_map_ok"] = len(unresolved) == 0
+
+        # 3. Registry accessible
+        try:
+            reg_path = REGISTRY_PATH
+            checks["registry_exists"] = reg_path.exists()
+        except Exception:
+            checks["registry_exists"] = False
+
+        # 4. Social config with at least 1 platform
+        platforms_configured = sum([
+            bool(self._social_config.mastodon_instance_url),
+            bool(self._social_config.discord_webhook_url),
+            bool(self._social_config.bluesky_handle),
+            bool(self._social_config.ghost_api_url),
+        ])
+        checks["platforms_configured"] = platforms_configured
+        checks["social_config_ok"] = platforms_configured > 0
+
+        # 5. Sample render quality check
+        sample_ok = False
+        if templates:
+            try:
+                sample = templates[0]
+                channels = sample.channels[:1]
+                if channels:
+                    results = self.render_and_check(
+                        sample.template_id, "sample-repo", channels,
+                    )
+                    sample_ok = len(results) > 0
+            except Exception as exc:
+                logger.warning("Sample render failed: %s", exc)
+        checks["sample_render_ok"] = sample_ok
+
+        # Overall go/no-go
+        checks["ready"] = all([
+            checks["templates_ok"],
+            checks["event_map_ok"],
+            checks["sample_render_ok"],
+        ])
+
+        return checks
 
     def poll_for_events(self) -> list[dict[str, str]]:
         """Poll RSS feed for new content entries."""
         if not self._social_config.rss_feed_url:
             return []
-        poller = RssPoller(feed_url=self._social_config.rss_feed_url)
+        seen_path = None
+        if self._social_config.delivery_log_path:
+            seen_path = Path(self._social_config.delivery_log_path).with_name("rss_seen.json")
+        poller = RssPoller(feed_url=self._social_config.rss_feed_url, seen_path=seen_path)
         entries = poller.poll()
         return [
             {"title": e.title, "url": e.url, "id": e.entry_id}
@@ -340,6 +427,11 @@ class KerygmaPipeline:
 
 
 def main(argv: list[str] | None = None) -> None:
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(name)s %(levelname)s %(message)s",
+    )
+
     parser = argparse.ArgumentParser(
         prog="kerygma_pipeline",
         description="ORGAN VII Kerygma distribution pipeline",
@@ -357,6 +449,8 @@ def main(argv: list[str] | None = None) -> None:
     sub.add_parser("poll", help="Poll RSS for new events")
     sub.add_parser("templates", help="List available templates")
     sub.add_parser("status", help="Pipeline health report")
+    sub.add_parser("activate", help="Pre-flight checks for pipeline readiness")
+    sub.add_parser("metrics", help="Pull and display current platform metrics")
 
     preview_p = sub.add_parser("preview", help="Render template preview without dispatching")
     preview_p.add_argument("--template", required=True, help="Template ID")
@@ -402,6 +496,12 @@ def main(argv: list[str] | None = None) -> None:
     elif args.command == "status":
         report = pipeline.status()
         print(json.dumps(report, indent=2))
+    elif args.command == "activate":
+        report = pipeline.activate()
+        print(json.dumps(report, indent=2))
+    elif args.command == "metrics":
+        metrics = pipeline._collect_platform_metrics()
+        print(json.dumps(metrics, indent=2))
     elif args.command == "preview":
         text = pipeline.preview(args.template, args.repo, args.channel)
         print(text)
