@@ -15,7 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
-import sys
+import os
 import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -35,10 +35,10 @@ from kerygma_social.rss_poller import RssPoller
 
 from kerygma_strategy.analytics import AnalyticsCollector, EngagementMetric
 from kerygma_strategy.persistence import JsonStore
-from kerygma_strategy.scheduler import ContentScheduler, ScheduleEntry, Frequency, PrioritizedEntry
-from kerygma_strategy.calendar import DistributionCalendar, CalendarEvent
-from kerygma_strategy.channels import ChannelRegistry, ChannelConfig
-from kerygma_strategy.report_generator import ReportGenerator, ReportPeriod, ReportData
+from kerygma_strategy.scheduler import ContentScheduler, ScheduleEntry, Frequency
+from kerygma_strategy.calendar import DistributionCalendar
+from kerygma_strategy.channels import ChannelRegistry
+from kerygma_strategy.report_generator import ReportGenerator, ReportPeriod
 
 # Optional: per-project profile support (kerygma-profiles package)
 try:
@@ -214,6 +214,24 @@ class KerygmaPipeline:
         self._schedule_store.set("schedule_entries", entries)
         self._schedule_store.save()
 
+    def _resolve_profile(
+        self, repo_name: str | None = None, profile_id: str | None = None,
+    ):
+        """Resolve a project profile by explicit ID or repo name.
+
+        Returns None if profiles are not loaded or no match is found.
+        """
+        if not self._profile_registry or self._profile_registry.total_profiles == 0:
+            return None
+        try:
+            if profile_id:
+                return self._profile_registry.get(profile_id)
+            elif repo_name:
+                return self._profile_registry.resolve(repo_name)
+        except KeyError:
+            pass
+        return None
+
     def _build_distributor(
         self, repo_name: str | None = None, profile_id: str | None = None,
     ) -> PosseDistributor:
@@ -224,23 +242,13 @@ class KerygmaPipeline:
         2. Profile matched by repo_name
         3. Fallback to global SocialConfig
         """
-        if self._profile_registry and self._profile_registry.total_profiles > 0:
-            try:
-                if profile_id:
-                    profile = self._profile_registry.get(profile_id)
-                elif repo_name:
-                    profile = self._profile_registry.resolve(repo_name)
-                else:
-                    profile = None
-
-                if profile:
-                    return build_distributor_for_profile(
-                        profile, _profile_resolve_secret,
-                        delivery_log=self._delivery_log,
-                        live=self._social_config.live_mode,
-                    )
-            except (KeyError, NameError):
-                pass
+        profile = self._resolve_profile(repo_name=repo_name, profile_id=profile_id)
+        if profile:
+            return build_distributor_for_profile(
+                profile, _profile_resolve_secret,
+                delivery_log=self._delivery_log,
+                live=self._social_config.live_mode,
+            )
         return build_distributor(self._social_config, delivery_log=self._delivery_log)
 
     def select_template(self, event_type: str) -> str:
@@ -271,15 +279,7 @@ class KerygmaPipeline:
             )
 
         # Resolve profile for voice variables
-        profile = None
-        if self._profile_registry and self._profile_registry.total_profiles > 0:
-            try:
-                if profile_id:
-                    profile = self._profile_registry.get(profile_id)
-                else:
-                    profile = self._profile_registry.resolve(repo_name)
-            except KeyError:
-                pass
+        profile = self._resolve_profile(repo_name=repo_name, profile_id=profile_id)
 
         context = self._registry.build_context(event, repo_name, profile=profile)
         results: dict[str, str] = {}
@@ -399,15 +399,7 @@ class KerygmaPipeline:
         """Render a single template+channel for preview without dispatching."""
         event = EventContext(event_type=template_id, repo_name=repo_name)
 
-        profile = None
-        if self._profile_registry and self._profile_registry.total_profiles > 0:
-            try:
-                if profile_id:
-                    profile = self._profile_registry.get(profile_id)
-                else:
-                    profile = self._profile_registry.resolve(repo_name)
-            except KeyError:
-                pass
+        profile = self._resolve_profile(repo_name=repo_name, profile_id=profile_id)
 
         context = self._registry.build_context(event, repo_name, profile=profile)
         render = self._engine.render(template_id, context, channel)
@@ -626,7 +618,7 @@ class KerygmaPipeline:
                 )
 
                 if channel_texts:
-                    records = self.dispatch(channel_texts)
+                    records = self.dispatch(channel_texts, repo_name=entry.content_id)
                     self.record_analytics(records)
                     self._scheduler.publish_entry(entry.entry_id)
                     results.append({
@@ -879,12 +871,19 @@ def main(argv: list[str] | None = None) -> None:
     if args.analytics_store:
         schedule_store = args.analytics_store.parent / "schedule.json"
 
+    # Resolve profiles directory: CLI flag > env var > None
+    profiles_dir = args.profiles_dir
+    if profiles_dir is None:
+        env_profiles = os.environ.get("KERYGMA_PROFILES_DIR")
+        if env_profiles:
+            profiles_dir = Path(env_profiles)
+
     pipeline = KerygmaPipeline(
         social_config_path=args.social_config,
         analytics_store_path=args.analytics_store,
         calendar_config_path=args.calendar_config or args.social_config,
         schedule_store_path=schedule_store,
-        profiles_dir=args.profiles_dir,
+        profiles_dir=profiles_dir,
     )
 
     if args.command == "dispatch":
@@ -996,6 +995,7 @@ def main(argv: list[str] | None = None) -> None:
             if not profile:
                 print(f"Profile '{args.profile_id}' not found.")
             else:
+                from kerygma_profiles.cli import redact_secrets
                 import json as _json
                 print(_json.dumps({
                     "profile_id": profile.profile_id,
@@ -1003,12 +1003,13 @@ def main(argv: list[str] | None = None) -> None:
                     "organ": profile.organ,
                     "repos": profile.repos,
                     "voice": profile.voice,
+                    "platforms": redact_secrets(profile.platforms),
                     "channels": profile.channels,
                     "rss_feed_url": profile.rss_feed_url,
                 }, indent=2))
         elif cmd == "validate":
-            from kerygma_profiles.cli import _cmd_validate
-            _cmd_validate(pipeline._profile_registry, args.profile_id)
+            from kerygma_profiles.cli import cmd_validate
+            cmd_validate(pipeline._profile_registry, args.profile_id)
 
 
 if __name__ == "__main__":

@@ -157,3 +157,33 @@ class TestBackwardCompatibility:
             "essay-announce", "public-process", ["mastodon"],
         )
         assert len(results) >= 0  # may fail quality check, but should not crash
+
+
+class TestProcessDueWithProfiles:
+    def test_due_entries_thread_repo_name_to_dispatch(
+        self, pipeline_with_profiles,
+    ):
+        """process_due_entries should pass content_id as repo_name to dispatch."""
+        from datetime import datetime, timedelta
+
+        pipeline_with_profiles.schedule_content(
+            content_id="public-process",
+            channels=["mastodon"],
+            scheduled_time=datetime.now() - timedelta(hours=1),
+        )
+
+        with patch.object(
+            pipeline_with_profiles, "render_and_check",
+            return_value={"mastodon": "Test post https://example.com"},
+        ), patch.object(
+            pipeline_with_profiles, "dispatch",
+            return_value=[{"channel": "mastodon", "status": "published", "url": "", "error": ""}],
+        ) as mock_dispatch:
+            results = pipeline_with_profiles.process_due_entries()
+
+        assert len(results) >= 1
+        assert results[0]["status"] == "dispatched"
+        mock_dispatch.assert_called_once_with(
+            {"mastodon": "Test post https://example.com"},
+            repo_name="public-process",
+        )
