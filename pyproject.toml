@@ -1,0 +1,32 @@
+[build-system]
+requires = ["setuptools>=68.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "kerygma-pipeline"
+version = "0.3.0"
+description = "End-to-end distribution pipeline orchestrator for ORGAN-VII Kerygma"
+requires-python = ">=3.11"
+dependencies = [
+    "kerygma-templates",
+    "kerygma-social",
+    "kerygma-strategy",
+    "pyyaml>=6.0",
+    "feedparser>=6.0",
+]
+
+[tool.setuptools]
+py-modules = ["kerygma_pipeline"]
+
+[project.scripts]
+kerygma-pipeline = "kerygma_pipeline:main"
+
+[project.optional-dependencies]
+dev = ["pytest>=7.0", "ruff>=0.4.0"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py311"
+line-length = 99
