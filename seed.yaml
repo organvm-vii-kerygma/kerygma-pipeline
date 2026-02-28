@@ -1,0 +1,44 @@
+# seed.yaml — Automation Contract for organvm-vii-kerygma/kerygma-pipeline
+# Schema: seed/v1.0
+# Generated: 2026-02-28
+# Category: standard
+
+schema_version: "1.0"
+organ: VII
+organ_name: Marketing
+repo: kerygma-pipeline
+org: organvm-vii-kerygma
+
+metadata:
+  implementation_status: PRODUCTION
+  tier: standard
+  promotion_status: GRADUATED
+  last_validated: "2026-02-28"
+  generated: "2026-02-28"
+
+produces:
+  - type: distribution_event
+    description: "End-to-end dispatch events combining template, social, and strategy"
+    consumers: [ORGAN-IV]
+
+consumes:
+  - type: template_registry
+    source: announcement-templates
+    description: "Template definitions and rendering engine"
+  - type: social_config
+    source: social-automation
+    description: "Platform distributors and delivery log"
+  - type: distribution_strategy
+    source: distribution-strategy
+    description: "Analytics, scheduling, and channel routing"
+
+subscriptions:
+  - event: product.release
+    source: ORGAN-III
+    action: Poll for new release and dispatch announcement
+  - event: essay.published
+    source: ORGAN-V
+    action: Trigger POSSE distribution pipeline
+  - event: promotion.completed
+    source: ORGAN-IV
+    action: Orchestrate multi-channel announcement
