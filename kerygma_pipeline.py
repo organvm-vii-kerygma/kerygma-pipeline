@@ -87,6 +87,8 @@ EVENT_TEMPLATE_MAP: dict[str, str] = {
     "feature-released": "feature-release",
     "bugfix-released": "bugfix-release",
     "repo-launched": "repo-launch",
+    "product.release": "repo-launch",
+    "product.milestone": "community-milestone",
     # ORGAN-IV: Taxis
     "milestone-reached": "system-milestone",
     "audit-completed": "system-milestone",
