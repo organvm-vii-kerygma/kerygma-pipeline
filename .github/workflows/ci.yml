@@ -14,6 +14,12 @@ jobs:
       - uses: actions/setup-python@v5
         with:
           python-version: "3.12"
+      - name: Install dependencies from GitHub
+        run: |
+          pip install "git+https://${{ secrets.GITHUB_TOKEN }}@github.com/organvm-vii-kerygma/announcement-templates.git"
+          pip install "git+https://${{ secrets.GITHUB_TOKEN }}@github.com/organvm-vii-kerygma/social-automation.git"
+          pip install "git+https://${{ secrets.GITHUB_TOKEN }}@github.com/organvm-vii-kerygma/distribution-strategy.git"
+          pip install "git+https://${{ secrets.GITHUB_TOKEN }}@github.com/organvm-vii-kerygma/kerygma-profiles.git"
       - run: pip install -e ".[dev]"
       - run: python -m pytest tests/ -v
       - run: python -m ruff check kerygma_pipeline.py
