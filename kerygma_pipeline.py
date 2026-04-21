@@ -103,6 +103,8 @@ EVENT_TEMPLATE_MAP: dict[str, str] = {
     # ORGAN-VII: Kerygma
     "press-release": "press-release",
     "grant-update": "grant-supplement",
+    # Contributions
+    "contribution-merged": "contribution-merged",
     # System-level
     "organ-launched": "organ-launch",
     "breaking-change": "breaking-change",
